@@ -30,7 +30,7 @@ import (
 	"log"
 	"time"
 
-	"http-client-ease/httpease" // Import the library
+	"github.com/jackman0925/http-client-ease/httpease" // Import the library
 )
 
 // Define your response struct
