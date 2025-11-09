@@ -168,4 +168,174 @@ func TestClient(t *testing.T) {
 			t.Errorf("Expected error to be a timeout error, but got: %v", err)
 		}
 	})
+
+	t.Run("Successful PUT request", func(t *testing.T) {
+		server := setupTestServer(t, successHandler)
+		defer server.Close()
+
+		client := NewClient(server.URL)
+		requestBody := map[string]string{"data": "update"}
+
+		resp, err := Put[testResponse](context.Background(), client, "/update", requestBody, WithHeader("Authorization", "Bearer test-token"))
+
+		if err != nil {
+			t.Fatalf("Expected no error, but got: %v", err)
+		}
+		if resp.Message != successResponse.Message {
+			t.Errorf("Expected message 'success', but got '%s'", resp.Message)
+		}
+	})
+
+	t.Run("Successful DELETE request", func(t *testing.T) {
+		server := setupTestServer(t, successHandler)
+		defer server.Close()
+
+		client := NewClient(server.URL)
+
+		resp, err := Delete[testResponse](context.Background(), client, "/delete", nil, WithHeader("Authorization", "Bearer test-token"))
+
+		if err != nil {
+			t.Fatalf("Expected no error, but got: %v", err)
+		}
+		if resp.Message != successResponse.Message {
+			t.Errorf("Expected message 'success', but got '%s'", resp.Message)
+		}
+	})
+
+	t.Run("Client with custom HttpClient", func(t *testing.T) {
+		server := setupTestServer(t, successHandler)
+		defer server.Close()
+
+		customTransport := &http.Transport{}
+		customHttpClient := &http.Client{
+			Transport: customTransport,
+			Timeout:   10 * time.Second,
+		}
+
+		client := NewClient(server.URL, WithHttpClient(customHttpClient))
+
+		// Verify that the custom client is used
+		if client.httpClient.Timeout != 10*time.Second {
+			t.Errorf("Expected http client timeout to be 10s, but got %v", client.httpClient.Timeout)
+		}
+		if client.httpClient.Transport != customTransport {
+			t.Error("Expected http client to use the custom transport")
+		}
+
+		_, err := Get[testResponse](context.Background(), client, "/data", WithHeader("Authorization", "Bearer test-token"))
+		if err != nil {
+			t.Fatalf("Expected no error, but got: %v", err)
+		}
+	})
+
+	t.Run("JSON marshaling error", func(t *testing.T) {
+		client := NewClient("http://localhost")
+		// Create a body that cannot be marshaled to JSON (e.g., a channel)
+		invalidBody := make(chan int)
+
+		_, err := Post[testResponse](context.Background(), client, "/", invalidBody)
+
+		if err == nil {
+			t.Fatal("Expected a JSON marshaling error, but got nil")
+		}
+		if !strings.Contains(err.Error(), "error marshaling JSON") {
+			t.Errorf("Expected error to be a JSON marshaling error, but got: %v", err)
+		}
+	})
+
+	t.Run("JSON decoding error", func(t *testing.T) {
+		// Handler returns malformed JSON
+		malformedJSONHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"message": "success", "value": "not-an-int"}`)) // Value is a string, not int
+		})
+
+		server := setupTestServer(t, malformedJSONHandler)
+		defer server.Close()
+
+		client := NewClient(server.URL)
+		_, err := Get[testResponse](context.Background(), client, "/")
+
+		if err == nil {
+			t.Fatal("Expected a JSON decoding error, but got nil")
+		}
+		if !strings.Contains(err.Error(), "error decoding response JSON") {
+			t.Errorf("Expected error to be a JSON decoding error, but got: %v", err)
+		}
+	})
+
+	t.Run("Invalid base URL", func(t *testing.T) {
+		// Create a client with an invalid base URL (contains control characters)
+		client := NewClient("http://invalid-url:\n")
+		_, err := Get[testResponse](context.Background(), client, "/")
+
+		if err == nil {
+			t.Fatal("Expected an error for invalid base URL, but got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid base URL") {
+			t.Errorf("Expected error to be an invalid base URL error, but got: %v", err)
+		}
+	})
+
+	t.Run("HTTP error with body read error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// A more reliable way to cause a read error is to just close the connection.
+			// The httptest server's default behavior after the handler returns is to close the connection.
+			// To simulate an abrupt close, we can use the Hijacker.
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusInternalServerError)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			// Instead of writing a response, just close the connection.
+			conn.Close()
+		}))
+
+		defer server.Close()
+
+		client := NewClient(server.URL)
+		_, err := Get[testResponse](context.Background(), client, "/")
+
+		if err == nil {
+			t.Fatal("Expected an error, but got nil")
+		}
+
+		// was closed unexpectedly. This error is wrapped by our "failed to read response body" message.
+		if !strings.Contains(err.Error(), "failed to read response body") {
+			t.Errorf("Expected error to be about reading the response body, but got: %v", err)
+		}
+	})
+
+	t.Run("Invalid endpoint URL", func(t *testing.T) {
+		client := NewClient("http://localhost")
+		_, err := Get[testResponse](context.Background(), client, "http://invalid-url:\n")
+
+		if err == nil {
+			t.Fatal("Expected an error for invalid endpoint URL, but got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid endpoint URL") {
+			t.Errorf("Expected error to be an invalid endpoint URL error, but got: %v", err)
+		}
+	})
+
+	t.Run("Invalid HTTP method", func(t *testing.T) {
+		client := NewClient("http://localhost")
+		// Call doRequest directly to provide an invalid method
+		_, err := doRequest[testResponse](context.Background(), client, "INVALID METHOD", "/", nil)
+
+		if err == nil {
+			t.Fatal("Expected an error for invalid HTTP method, but got nil")
+		}
+		if !strings.Contains(err.Error(), "error creating request") {
+			t.Errorf("Expected error to be an invalid method error, but got: %v", err)
+		}
+	})
 }
