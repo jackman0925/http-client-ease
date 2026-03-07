@@ -43,7 +43,7 @@ func main() {
 	client := httpease.NewClient("http://localhost:11434", httpease.WithTimeout(30*time.Second))
 
 	// 2. Create a context with a timeout for the request
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// 3. Prepare the request body
