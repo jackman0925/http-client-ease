@@ -14,7 +14,7 @@
 To install the library, use `go get`:
 
 ```bash
-go get http-client-ease
+go get github.com/jackman0925/http-client-ease
 ```
 
 ## Usage
@@ -27,10 +27,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
-	"github.com/jackman0925/http-client-ease/httpease" // Import the library
+	"github.com/jackman0925/http-client-ease"
 )
 
 // Define your response struct

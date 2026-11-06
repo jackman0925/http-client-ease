@@ -73,6 +73,36 @@ func TestClient(t *testing.T) {
 		}
 	})
 
+	t.Run("No content response is successful", func(t *testing.T) {
+		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+
+		resp, err := Delete[testResponse](context.Background(), NewClient(server.URL), "/resource", nil)
+		if err != nil {
+			t.Fatalf("Expected no error, but got: %v", err)
+		}
+		if resp == nil || resp.Message != "" || resp.Value != 0 {
+			t.Errorf("Expected zero-value response, but got %+v", resp)
+		}
+	})
+
+	t.Run("Empty successful response is successful", func(t *testing.T) {
+		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		resp, err := Get[testResponse](context.Background(), NewClient(server.URL), "/resource")
+		if err != nil {
+			t.Fatalf("Expected no error, but got: %v", err)
+		}
+		if resp.Message != "" || resp.Value != 0 {
+			t.Errorf("Expected zero-value response, but got %+v", resp)
+		}
+	})
+
 	t.Run("Request with full URL endpoint", func(t *testing.T) {
 		server := setupTestServer(t, successHandler)
 		defer server.Close()
@@ -132,7 +162,6 @@ func TestClient(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		}))
 		defer server.Close()
-
 
 		client := NewClient(server.URL)
 		ctx, cancel := context.WithCancel(context.Background())

@@ -162,7 +162,10 @@ func doRequest[T any](ctx context.Context, c *Client, method, endpoint string, b
 	}
 
 	var responseBody T
-	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
+	if resp.StatusCode == http.StatusNoContent {
+		return &responseBody, nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("error decoding response JSON: %w", err)
 	}
 
