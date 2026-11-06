@@ -73,6 +73,32 @@ func TestClient(t *testing.T) {
 		}
 	})
 
+	t.Run("Content-Type is only set for JSON bodies", func(t *testing.T) {
+		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/without-body":
+				if contentType := r.Header.Get("Content-Type"); contentType != "" {
+					t.Errorf("Expected no Content-Type header, got %q", contentType)
+				}
+			case "/with-body":
+				if contentType := r.Header.Get("Content-Type"); contentType != "application/json" {
+					t.Errorf("Expected application/json Content-Type, got %q", contentType)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(successResponseBody)
+		}))
+		defer server.Close()
+
+		client := NewClient(server.URL)
+		if _, err := Get[testResponse](context.Background(), client, "/without-body"); err != nil {
+			t.Fatalf("GET request failed: %v", err)
+		}
+		if _, err := Post[testResponse](context.Background(), client, "/with-body", map[string]string{"data": "test"}); err != nil {
+			t.Fatalf("POST request failed: %v", err)
+		}
+	})
+
 	t.Run("No content response is successful", func(t *testing.T) {
 		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)

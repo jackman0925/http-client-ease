@@ -138,7 +138,9 @@ func doRequest[T any](ctx context.Context, c *Client, method, endpoint string, b
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	for _, opt := range reqOpts {
 		opt(req)
 	}
