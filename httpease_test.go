@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -196,6 +197,67 @@ func TestBearerToken(t *testing.T) {
 	}
 	if _, err := GetJSON[testResponse](context.Background(), client, "/"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBearerTokenProviderUsesCurrentToken(t *testing.T) {
+	var token atomic.Value
+	token.Store("first-token")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"message":"` + request.Header.Get("Authorization") + `"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, WithBearerTokenProvider(func(context.Context) (string, error) {
+		return token.Load().(string), nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := GetJSON[testResponse](context.Background(), client, "/")
+	if err != nil || first.Data == nil || first.Data.Message != "Bearer first-token" {
+		t.Fatalf("Unexpected first token response: response=%+v error=%v", first, err)
+	}
+	token.Store("rotated-token")
+	second, err := GetJSON[testResponse](context.Background(), client, "/")
+	if err != nil || second.Data == nil || second.Data.Message != "Bearer rotated-token" {
+		t.Fatalf("Unexpected rotated token response: response=%+v error=%v", second, err)
+	}
+}
+
+func TestBearerTokenProviderFailuresAndRequestOverride(t *testing.T) {
+	if _, err := NewClient("https://example.com", WithBearerTokenProvider(nil)); err == nil {
+		t.Error("Expected nil provider error")
+	}
+	if _, err := NewClient("https://example.com", WithBearerToken("static"), WithBearerTokenProvider(func(context.Context) (string, error) { return "dynamic", nil })); err == nil {
+		t.Error("Expected conflicting token configuration error")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("Authorization"); got != "Bearer override" {
+			t.Errorf("Expected per-request token override, got %q", got)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"message":"ok"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, WithBearerTokenProvider(func(context.Context) (string, error) {
+		return "provider", nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GetJSON[testResponse](context.Background(), client, "/", WithHeader("Authorization", "Bearer override")); err != nil {
+		t.Fatal(err)
+	}
+	failingClient, err := NewClient(server.URL, WithBearerTokenProvider(func(context.Context) (string, error) {
+		return "", errors.New("token service unavailable")
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GetJSON[testResponse](context.Background(), failingClient, "/"); err == nil || !strings.Contains(err.Error(), "token service unavailable") {
+		t.Errorf("Expected provider error, got %v", err)
 	}
 }
 

@@ -5,7 +5,7 @@
 ## 未发布
 
 
-## [0.2.0] - 2026-11-06
+## [0.2.1] - 2026-11-06
 
 ### 新增
 
@@ -13,7 +13,7 @@
 - `HTTPError`：提供请求方法、已脱敏的 URL、响应头、Content-Type、请求 ID、`Retry-After`、原始错误 body 与截断标记。
 - JSON 请求函数：`GetJSON`、`HeadJSON`、`OptionsJSON`、`PostJSON`、`PutJSON`、`PatchJSON`、`DeleteJSON` 与 `DoJSON`。
 - `Client.Do`：适用于需要将非 2xx 转为错误的原始请求；`Client.DoRaw`：适用于需要自行检查任意状态码响应的场景。
-- `WithBearerToken`、`WithDefaultHeader`、`WithQuery` 与 `WithAbsoluteURLs` 配置项。
+- `WithBearerToken`、`WithBearerTokenProvider`、`WithDefaultHeader`、`WithQuery` 与 `WithAbsoluteURLs` 配置项。
 - `WithRetryPolicy`：显式启用重试，并支持 `Retry-After`。
 - `WithRequestHook`：观测每一次 HTTP 尝试，包括重试。
 - 业务接入模板：`examples/example.go`，覆盖 GET、POST、PUT、DELETE、认证、重试和统一错误处理。

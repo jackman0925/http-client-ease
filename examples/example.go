@@ -33,7 +33,14 @@ func main() {
 	client, err := httpease.NewClient(
 		baseURL,
 		httpease.WithTimeout(10*time.Second),
-		httpease.WithBearerToken(os.Getenv("API_TOKEN")),
+		httpease.WithBearerTokenProvider(func(context.Context) (string, error) {
+			// In production, call the business system's token cache/refresh manager here.
+			token := os.Getenv("API_TOKEN")
+			if token == "" {
+				return "", errors.New("API_TOKEN is not configured")
+			}
+			return token, nil
+		}),
 		httpease.WithRetryPolicy(httpease.RetryPolicy{
 			MaxAttempts: 3,
 			BaseDelay:   200 * time.Millisecond,

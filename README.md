@@ -85,7 +85,17 @@ defer response.Body.Close()
 
 ## Authentication, retries, and observability
 
-Use `WithBearerToken` for static Bearer authentication. For other schemes, use `WithDefaultHeader` or a custom `http.Client` transport.
+Use `WithBearerToken` for static Bearer authentication. For rotating credentials, use `WithBearerTokenProvider`: the callback runs before each request, while the business system owns token caching, refresh, and concurrency control. A per-request `Authorization` header overrides the provider.
+
+```go
+client, err := httpease.NewClient(baseURL,
+	httpease.WithBearerTokenProvider(func(ctx context.Context) (string, error) {
+		return tokenManager.Current(ctx) // Refresh or read from a cache as needed.
+	}),
+)
+```
+
+For other authentication schemes, use `WithDefaultHeader` or a custom `http.Client` transport.
 
 Retries are disabled by default. To opt in, configure a `RetryPolicy`:
 

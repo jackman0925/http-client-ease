@@ -21,6 +21,8 @@ type clientConfig struct {
 	httpClient        *http.Client
 	timeout           *time.Duration
 	headers           http.Header
+	tokenProvider     BearerTokenProvider
+	staticBearerToken bool
 	maxErrorBodyBytes int64
 	allowAbsoluteURLs bool
 	retryPolicy       *RetryPolicy
@@ -63,7 +65,31 @@ func WithBearerToken(token string) ClientOption {
 		if token == "" {
 			return errors.New("bearer token must not be empty")
 		}
+		if config.tokenProvider != nil {
+			return errors.New("static bearer token and token provider cannot both be configured")
+		}
 		config.headers.Set("Authorization", "Bearer "+token)
+		config.staticBearerToken = true
+		return nil
+	}
+}
+
+// BearerTokenProvider returns the current Bearer token for a request. The
+// provider owns token caching, refresh, and concurrent access.
+type BearerTokenProvider func(context.Context) (string, error)
+
+// WithBearerTokenProvider obtains a token before each request. It is intended
+// for rotating credentials such as OAuth tokens. A per-request Authorization
+// header takes precedence over the provider.
+func WithBearerTokenProvider(provider BearerTokenProvider) ClientOption {
+	return func(config *clientConfig) error {
+		if provider == nil {
+			return errors.New("bearer token provider must not be nil")
+		}
+		if config.staticBearerToken {
+			return errors.New("static bearer token and token provider cannot both be configured")
+		}
+		config.tokenProvider = provider
 		return nil
 	}
 }
@@ -142,6 +168,7 @@ type Client struct {
 	baseURL           *url.URL
 	httpClient        *http.Client
 	headers           http.Header
+	tokenProvider     BearerTokenProvider
 	maxErrorBodyBytes int64
 	allowAbsoluteURLs bool
 	retryPolicy       *RetryPolicy
@@ -179,6 +206,7 @@ func NewClient(baseURL string, options ...ClientOption) (*Client, error) {
 		baseURL:           parsedBaseURL,
 		httpClient:        client,
 		headers:           config.headers.Clone(),
+		tokenProvider:     config.tokenProvider,
 		maxErrorBodyBytes: config.maxErrorBodyBytes,
 		allowAbsoluteURLs: config.allowAbsoluteURLs,
 		retryPolicy:       config.retryPolicy,
@@ -243,6 +271,16 @@ func (client *Client) newRequest(ctx context.Context, method, endpoint string, b
 		if err := option(request); err != nil {
 			return nil, fmt.Errorf("apply request option: %w", err)
 		}
+	}
+	if client.tokenProvider != nil && request.Header.Get("Authorization") == "" {
+		token, err := client.tokenProvider(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get bearer token: %w", err)
+		}
+		if token == "" {
+			return nil, errors.New("bearer token provider returned an empty token")
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
 	}
 	return request, nil
 }
