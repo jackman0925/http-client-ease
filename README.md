@@ -1,25 +1,14 @@
 # http-client-ease
 
-`http-client-ease` is a Go library designed to simplify making RESTful HTTP requests, making it easier for Go projects to integrate with RESTful APIs.
+`http-client-ease` is a small, opinionated HTTP client for company services. It makes JSON calls concise while preserving enough structured information to diagnose API, gateway, and Nginx failures.
 
-## Features
-
--   **Type-Safe Responses**: Automatically unmarshals JSON responses into your Go structs.
--   **Functional Options**: Easily configure HTTP clients (e.g., timeouts, custom `http.Client`) and requests (e.g., headers).
--   **Context-Aware**: Supports `context.Context` for request cancellation and timeouts.
--   **Error Handling**: Provides a custom `HTTPError` type for detailed information on non-2xx responses.
-
-## Installation
-
-To install the library, use `go get`:
+## Install
 
 ```bash
 go get github.com/jackman0925/http-client-ease
 ```
 
-## Usage
-
-Here's a quick example of how to use `httpease` to make a POST request:
+## JSON requests
 
 ```go
 package main
@@ -27,72 +16,109 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"time"
 
-	"github.com/jackman0925/http-client-ease"
+	httpease "github.com/jackman0925/http-client-ease"
 )
 
-// Define your response struct
-type GenerateResponse struct {
-	Response string `json:"response"`
+type User struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 func main() {
-	// 1. Create a new client with a custom timeout
-	client := httpease.NewClient("http://localhost:11434", httpease.WithTimeout(30*time.Second))
-
-	// 2. Create a context with a timeout for the request
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// 3. Prepare the request body
-	requestBody := map[string]any{"prompt": "Why is the sky blue?"}
-
-	// 4. Make a POST request, adding a custom header
-	response, err := httpease.Post[GenerateResponse](
-		ctx,
-		client,
-		"/api/generate",
-		requestBody,
-		httpease.WithHeader("Authorization", "Bearer my-token"),
+	client, err := httpease.NewClient(
+		"https://api.example.internal/v1",
+		httpease.WithTimeout(10*time.Second),
+		httpease.WithBearerToken("token"),
 	)
 	if err != nil {
-		// Handle custom HTTP errors
-		var httpErr *httpease.HTTPError
-		if errors.As(err, &httpErr) {
-			log.Fatalf("Request failed with status %d: %s", httpErr.StatusCode, string(httpErr.Body))
-		}
-		log.Fatal("Error making POST request:", err)
+		log.Fatal(err)
 	}
 
-	// 5. Use the type-safe response
-	fmt.Println("Response:", response.Response)
+	response, err := httpease.GetJSON[User](context.Background(), client, "/users/42")
+	if err != nil {
+		var httpError *httpease.HTTPError
+		if errors.As(err, &httpError) {
+			log.Printf("request failed: status=%d request_id=%s content_type=%s body=%q",
+				httpError.StatusCode, httpError.RequestID, httpError.ContentType, httpError.Body)
+		}
+		log.Fatal(err)
+	}
+
+	// Data is nil for 204 No Content and other empty successful responses.
+	if response.Data != nil {
+		log.Printf("user: %+v", *response.Data)
+	}
 }
 ```
 
-### Client Options
+The JSON helpers are `GetJSON`, `HeadJSON`, `OptionsJSON`, `PostJSON`, `PutJSON`, `PatchJSON`, `DeleteJSON`, and `DoJSON`. Go does not support type parameters on methods, so these are package functions that accept a configured `*Client`.
 
--   `httpease.WithTimeout(duration time.Duration)`: Sets the timeout for the underlying `http.Client`.
--   `httpease.WithHttpClient(client *http.Client)`: Provides a custom `http.Client` instance.
--   `httpease.WithMaxErrorBodyBytes(limit int64)`: Limits the error-response body retained in `HTTPError` (default: 64 KiB).
+For a copy-ready application template covering GET, POST, PUT, DELETE, authentication, retries, and structured error handling, see [examples/example.go](examples/example.go). Set `API_BASE_URL` and `API_TOKEN`, then adapt the endpoint paths and payload structs.
 
-### Request Options
+## Errors and gateway responses
 
--   `httpease.WithHeader(key, value string)`: Adds a custom header to the request.
+Every non-2xx response becomes `*HTTPError`, whether its body is JSON, HTML, or plain text. It includes:
 
-## Error Handling
+- status code and status text;
+- request method and a query-redacted URL;
+- response headers, content type, request/correlation ID, and `Retry-After`;
+- the raw error body and a `Truncated` flag.
 
-The library returns a custom `*httpease.HTTPError` for non-2xx HTTP responses, allowing you to inspect the status code and response body. To avoid accidentally logging sensitive server output, `HTTPError.Error()` only includes status information. `Body` retains up to the configured limit and `Truncated` reports whether it was shortened.
+Error bodies are retained up to 64 KiB by default. Set `WithMaxErrorBodyBytes` to change the limit. `HTTPError.Error()` deliberately does not include the response body, so logging the error alone does not expose an HTML error page or server details. `Retryable()` identifies commonly retryable status codes; callers must still only retry requests that are safe to repeat.
+
+## Raw requests
+
+For downloads, uploads, streaming, or non-JSON protocols, use the configured client directly:
 
 ```go
+response, err := client.Do(ctx, http.MethodGet, "/reports/latest.csv", nil)
 if err != nil {
-    var httpErr *httpease.HTTPError
-    if errors.As(err, &httpErr) {
-        log.Printf("HTTP Error: Status %d, Body: %s", httpErr.StatusCode, string(httpErr.Body))
-    } else {
-        log.Printf("General Error: %v", err)
-    }
+	log.Fatal(err) // non-2xx is *httpease.HTTPError
 }
+defer response.Body.Close()
 ```
+
+`DoRaw` returns responses for all HTTP status codes when the caller must inspect an error response body directly. In both cases, callers close the returned body.
+
+## Authentication, retries, and observability
+
+Use `WithBearerToken` for static Bearer authentication. For other schemes, use `WithDefaultHeader` or a custom `http.Client` transport.
+
+Retries are disabled by default. To opt in, configure a `RetryPolicy`:
+
+```go
+client, err := httpease.NewClient(
+	"https://api.example.internal",
+	httpease.WithRetryPolicy(httpease.RetryPolicy{
+		MaxAttempts: 3, // includes the first attempt
+		BaseDelay:  100 * time.Millisecond,
+		MaxDelay:   2 * time.Second,
+	}),
+	httpease.WithRequestHook(func(event httpease.RequestEvent) {
+		// Called once per completed HTTP attempt, including retries.
+		metrics.Record(event.Request.Method, event.Response, event.Error, event.Duration)
+	}),
+)
+```
+
+The policy retries common transient statuses (`408`, `425`, `429`, `500`, `502`, `503`, `504`) and transport failures. It retries only idempotent methods (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, `TRACE`) by default, and only when the request body can be replayed. Set `AllowUnsafeMethods: true` only after the target API provides an idempotency key or equivalent duplicate-protection guarantee. `Retry-After` is respected when it asks for a longer delay.
+
+`RequestHook` is intentionally observational: it receives the request, raw response or transport error, attempt number, and duration. Hooks must return quickly and must not mutate the request or response. `DoRaw` does not retry because it hands its response body directly to the caller.
+
+## Security and URL rules
+
+Relative endpoints are joined to the base URL even when written with a leading slash: a base URL of `https://host/v1` and endpoint `/users` produces `https://host/v1/users`.
+
+Absolute endpoint URLs are disabled by default to prevent a request from accidentally bypassing the configured service. Enable them only for trusted targets with `WithAbsoluteURLs()`.
+
+## Breaking upgrade notes
+
+This release intentionally changes the API:
+
+1. Handle the `error` returned by `NewClient`.
+2. Replace `Get[T]`/`Post[T]` with `GetJSON[T]`/`PostJSON[T]`.
+3. Read JSON data from `response.Data`; it is nil for a successful empty response.
+4. Use `errors.As(err, &httpError)` for structured non-2xx diagnostics. Do not parse `err.Error()`.

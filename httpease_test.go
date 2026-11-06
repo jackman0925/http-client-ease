@@ -3,414 +3,301 @@ package httpease
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// testResponse is a standard struct for test responses.
 type testResponse struct {
 	Message string `json:"message"`
-	Value   int    `json:"value"`
 }
 
-// setupTestServer creates a httptest.Server with a configurable handler.
-func setupTestServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
-	return httptest.NewServer(handler)
+func TestJSONRequestAndResponseMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/users" {
+			t.Errorf("Unexpected path: %s", request.URL.Path)
+		}
+		if request.Header.Get("Authorization") != "Bearer default" {
+			t.Errorf("Unexpected authorization header: %q", request.Header.Get("Authorization"))
+		}
+		if request.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("Unexpected Content-Type: %q", request.Header.Get("Content-Type"))
+		}
+		writer.Header().Set("X-Request-ID", "request-123")
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"message":"ok"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL+"/api", WithDefaultHeader("Authorization", "Bearer default"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := PostJSON[testResponse](context.Background(), client, "/users", map[string]string{"name": "Ada"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Data == nil || response.Data.Message != "ok" {
+		t.Fatalf("Unexpected decoded response: %+v", response.Data)
+	}
+	if response.StatusCode != http.StatusOK || response.RequestID != "request-123" {
+		t.Errorf("Unexpected response metadata: %+v", response)
+	}
 }
 
-func TestClient(t *testing.T) {
-	// Common response for successful requests
-	successResponse := testResponse{Message: "success", Value: 123}
-	successResponseBody, _ := json.Marshal(successResponse)
+func TestEmptyJSONResponseHasNilData(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Common handler for successful requests
-	successHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check for custom header
-		if authHeader := r.Header.Get("Authorization"); authHeader != "Bearer test-token" {
-			http.Error(w, "missing or invalid authorization header", http.StatusUnauthorized)
+	response, err := DeleteJSON[testResponse](context.Background(), client, "/users/1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Data != nil || response.StatusCode != http.StatusNoContent {
+		t.Errorf("Expected empty 204 response, got %+v", response)
+	}
+}
+
+func TestJSONContentTypeIsBodyAwareAndOverridable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/without-body":
+			if contentType := request.Header.Get("Content-Type"); contentType != "" {
+				t.Errorf("GET unexpectedly sent Content-Type %q", contentType)
+			}
+		case "/custom-content-type":
+			if contentType := request.Header.Get("Content-Type"); contentType != "application/problem+json" {
+				t.Errorf("Custom Content-Type was ignored: %q", contentType)
+			}
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"message":"ok"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := GetJSON[testResponse](context.Background(), client, "/without-body"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PostJSON[testResponse](context.Background(), client, "/custom-content-type", map[string]string{"a": "b"}, WithHeader("Content-Type", "application/problem+json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHeadAndOptionsJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/health":
+			if request.Method != http.MethodHead {
+				t.Errorf("Expected HEAD, got %s", request.Method)
+			}
+			writer.Header().Set("X-Health", "ok")
+		case "/capabilities":
+			if request.Method != http.MethodOptions {
+				t.Errorf("Expected OPTIONS, got %s", request.Method)
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"message":"GET, POST"}`))
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	head, err := HeadJSON[testResponse](context.Background(), client, "/health")
+	if err != nil || head.Data != nil || head.Header.Get("X-Health") != "ok" {
+		t.Errorf("Unexpected HEAD response: response=%+v error=%v", head, err)
+	}
+	options, err := OptionsJSON[testResponse](context.Background(), client, "/capabilities")
+	if err != nil || options.Data == nil || options.Data.Message != "GET, POST" {
+		t.Errorf("Unexpected OPTIONS response: response=%+v error=%v", options, err)
+	}
+}
+
+func TestRetryPolicyRetriesSafeRequestsAndRunsHooks(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if attempts.Add(1) < 3 {
+			writer.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(successResponseBody)
-	})
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"message":"recovered"}`))
+	}))
+	defer server.Close()
 
-	t.Run("Successful POST request", func(t *testing.T) {
-		server := setupTestServer(t, successHandler)
-		defer server.Close()
-
-		client := NewClient(server.URL)
-		requestBody := map[string]string{"data": "test"}
-
-		resp, err := Post[testResponse](context.Background(), client, "/", requestBody, WithHeader("Authorization", "Bearer test-token"))
-
-		if err != nil {
-			t.Fatalf("Expected no error, but got: %v", err)
-		}
-		if resp.Message != successResponse.Message || resp.Value != successResponse.Value {
-			t.Errorf("Expected response %+v, but got %+v", successResponse, resp)
-		}
-	})
-
-	t.Run("Successful GET request", func(t *testing.T) {
-		server := setupTestServer(t, successHandler)
-		defer server.Close()
-
-		client := NewClient(server.URL)
-
-		resp, err := Get[testResponse](context.Background(), client, "/data", WithHeader("Authorization", "Bearer test-token"))
-
-		if err != nil {
-			t.Fatalf("Expected no error, but got: %v", err)
-		}
-		if resp.Message != successResponse.Message {
-			t.Errorf("Expected message 'success', but got '%s'", resp.Message)
-		}
-	})
-
-	t.Run("Content-Type is only set for JSON bodies", func(t *testing.T) {
-		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/without-body":
-				if contentType := r.Header.Get("Content-Type"); contentType != "" {
-					t.Errorf("Expected no Content-Type header, got %q", contentType)
-				}
-			case "/with-body":
-				if contentType := r.Header.Get("Content-Type"); contentType != "application/json" {
-					t.Errorf("Expected application/json Content-Type, got %q", contentType)
-				}
+	var hookAttempts atomic.Int32
+	client, err := NewClient(server.URL,
+		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond}),
+		WithRequestHook(func(event RequestEvent) {
+			if event.Response != nil {
+				hookAttempts.Add(1)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(successResponseBody)
-		}))
-		defer server.Close()
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := GetJSON[testResponse](context.Background(), client, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Data == nil || response.Data.Message != "recovered" || attempts.Load() != 3 || hookAttempts.Load() != 3 {
+		t.Errorf("Unexpected retry result: response=%+v attempts=%d hooks=%d", response, attempts.Load(), hookAttempts.Load())
+	}
+}
 
-		client := NewClient(server.URL)
-		if _, err := Get[testResponse](context.Background(), client, "/without-body"); err != nil {
-			t.Fatalf("GET request failed: %v", err)
+func TestRetryPolicyDoesNotRetryPostByDefault(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts.Add(1)
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = PostJSON[testResponse](context.Background(), client, "/", map[string]string{"order": "1"})
+	var httpError *HTTPError
+	if !errors.As(err, &httpError) || attempts.Load() != 1 {
+		t.Errorf("POST should not be retried by default: error=%v attempts=%d", err, attempts.Load())
+	}
+}
+
+func TestBearerToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("Authorization"); got != "Bearer token-123" {
+			t.Errorf("Unexpected authorization: %q", got)
 		}
-		if _, err := Post[testResponse](context.Background(), client, "/with-body", map[string]string{"data": "test"}); err != nil {
-			t.Fatalf("POST request failed: %v", err)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"message":"ok"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, WithBearerToken("token-123"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GetJSON[testResponse](context.Background(), client, "/"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGatewayHTMLErrorIncludesDiagnostics(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+		writer.Header().Set("X-Request-ID", "nginx-42")
+		writer.Header().Set("Retry-After", "30")
+		writer.WriteHeader(http.StatusBadGateway)
+		_, _ = writer.Write([]byte("<html><title>Bad Gateway</title></html>"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = GetJSON[testResponse](context.Background(), client, "/upstream?token=super-secret")
+	var httpError *HTTPError
+	if !errors.As(err, &httpError) {
+		t.Fatalf("Expected HTTPError, got %T: %v", err, err)
+	}
+	if httpError.ContentType != "text/html; charset=utf-8" || httpError.RequestID != "nginx-42" || httpError.RetryAfter != "30" {
+		t.Errorf("Missing gateway diagnostics: %+v", httpError)
+	}
+	if !bytes.Contains(httpError.Body, []byte("Bad Gateway")) || !httpError.Retryable() {
+		t.Errorf("Unexpected error body or retryability: %+v", httpError)
+	}
+	if bytes.Contains([]byte(httpError.Error()), []byte("super-secret")) || bytes.Contains([]byte(httpError.Error()), httpError.Body) {
+		t.Errorf("Error() leaked sensitive content: %q", httpError.Error())
+	}
+}
+
+func TestErrorBodyLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusInternalServerError)
+		_, _ = writer.Write([]byte("abcdefgh"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, WithMaxErrorBodyBytes(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = GetJSON[testResponse](context.Background(), client, "/")
+	var httpError *HTTPError
+	if !errors.As(err, &httpError) {
+		t.Fatalf("Expected HTTPError, got %T", err)
+	}
+	if !httpError.Truncated || string(httpError.Body) != "abcd" {
+		t.Errorf("Expected truncated error body, got %+v", httpError)
+	}
+}
+
+func TestRawRequestsAndURLPolicy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/download" {
+			t.Errorf("Unexpected path: %s", request.URL.Path)
 		}
-	})
+		writer.WriteHeader(http.StatusCreated)
+		_, _ = writer.Write([]byte("raw"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL + "/api")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	t.Run("No content response is successful", func(t *testing.T) {
-		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusNoContent)
-		}))
-		defer server.Close()
+	response, err := client.Do(context.Background(), http.MethodPost, "/download", bytes.NewBufferString("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if string(body) != "raw" {
+		t.Errorf("Unexpected raw response: %q", body)
+	}
+	if _, err := client.DoRaw(context.Background(), http.MethodGet, server.URL, nil); err == nil {
+		t.Error("Expected absolute endpoint to be rejected")
+	}
+}
 
-		resp, err := Delete[testResponse](context.Background(), NewClient(server.URL), "/resource", nil)
-		if err != nil {
-			t.Fatalf("Expected no error, but got: %v", err)
-		}
-		if resp == nil || resp.Message != "" || resp.Value != 0 {
-			t.Errorf("Expected zero-value response, but got %+v", resp)
-		}
-	})
+func TestConstructionValidation(t *testing.T) {
+	if _, err := NewClient("not-a-url"); err == nil {
+		t.Error("Expected invalid base URL error")
+	}
+	if _, err := NewClient("https://example.com", WithTimeout(-1)); err == nil {
+		t.Error("Expected invalid timeout error")
+	}
+	if _, err := NewClient("https://example.com", WithHTTPClient(nil)); err == nil {
+		t.Error("Expected nil client error")
+	}
+}
 
-	t.Run("Empty successful response is successful", func(t *testing.T) {
-		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		resp, err := Get[testResponse](context.Background(), NewClient(server.URL), "/resource")
-		if err != nil {
-			t.Fatalf("Expected no error, but got: %v", err)
-		}
-		if resp.Message != "" || resp.Value != 0 {
-			t.Errorf("Expected zero-value response, but got %+v", resp)
-		}
-	})
-
-	t.Run("Request with full URL endpoint", func(t *testing.T) {
-		server := setupTestServer(t, successHandler)
-		defer server.Close()
-
-		// Base URL is different, but we provide the full URL in the request
-		client := NewClient("http://some-other-url.com")
-		fullURL := server.URL + "/full/path"
-
-		resp, err := Get[testResponse](context.Background(), client, fullURL, WithHeader("Authorization", "Bearer test-token"))
-
-		if err != nil {
-			t.Fatalf("Expected no error, but got: %v", err)
-		}
-		if resp.Message != successResponse.Message {
-			t.Errorf("Expected message 'success', but got '%s'", resp.Message)
-		}
-	})
-
-	t.Run("HTTP error handling", func(t *testing.T) {
-		errorBody := `{"error": "not found"}`
-		errorHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(errorBody))
-		})
-
-		server := setupTestServer(t, errorHandler)
-		defer server.Close()
-
-		client := NewClient(server.URL)
-		_, err := Get[testResponse](context.Background(), client, "/notfound")
-
-		if err == nil {
-			t.Fatal("Expected an error, but got nil")
-		}
-
-		var httpErr *HTTPError
-		if !errors.As(err, &httpErr) {
-			t.Fatalf("Expected error of type *HTTPError, but got %T", err)
-		}
-
-		if httpErr.StatusCode != http.StatusNotFound {
-			t.Errorf("Expected status code %d, but got %d", http.StatusNotFound, httpErr.StatusCode)
-		}
-		if !strings.Contains(string(httpErr.Body), "not found") {
-			t.Errorf("Expected error body to contain 'not found', but got '%s'", string(httpErr.Body))
-		}
-		expectedErrorMsg := "http error: status code 404, status 404 Not Found"
-		if httpErr.Error() != expectedErrorMsg {
-			t.Errorf("Expected error message '%s', but got '%s'", expectedErrorMsg, httpErr.Error())
-		}
-	})
-
-	t.Run("HTTP error body is limited and excluded from Error", func(t *testing.T) {
-		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte("sensitive-error-body"))
-		}))
-		defer server.Close()
-
-		_, err := Get[testResponse](context.Background(), NewClient(server.URL, WithMaxErrorBodyBytes(9)), "/")
-		var httpErr *HTTPError
-		if !errors.As(err, &httpErr) {
-			t.Fatalf("Expected *HTTPError, but got %T", err)
-		}
-		if !httpErr.Truncated || !bytes.Equal(httpErr.Body, []byte("sensitive")) {
-			t.Errorf("Expected truncated body %q, got %q (truncated=%t)", "sensitive", httpErr.Body, httpErr.Truncated)
-		}
-		if strings.Contains(httpErr.Error(), "sensitive-error-body") {
-			t.Errorf("Error must not contain response body: %q", httpErr.Error())
-		}
-	})
-
-	t.Run("Context cancellation", func(t *testing.T) {
-		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			time.Sleep(100 * time.Millisecond) // Ensure the request is in-flight when context is canceled
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client := NewClient(server.URL)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel() // Cancel context immediately
-
-		_, err := Get[testResponse](ctx, client, "/")
-
-		if err == nil {
-			t.Fatal("Expected an error for canceled context, but got nil")
-		}
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("Expected context.Canceled error, but got: %v", err)
-		}
-	})
-
-	t.Run("Client with custom timeout", func(t *testing.T) {
-		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			time.Sleep(100 * time.Millisecond) // This will be longer than the client's timeout
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		// Create a client with a very short timeout
-		client := NewClient(server.URL, WithTimeout(50*time.Millisecond))
-
-		_, err := Get[testResponse](context.Background(), client, "/")
-
-		if err == nil {
-			t.Fatal("Expected a timeout error, but got nil")
-		}
-		// The error should be a url.Error indicating a timeout
-		if !strings.Contains(err.Error(), "context deadline exceeded") {
-			t.Errorf("Expected error to be a timeout error, but got: %v", err)
-		}
-	})
-
-	t.Run("Successful PUT request", func(t *testing.T) {
-		server := setupTestServer(t, successHandler)
-		defer server.Close()
-
-		client := NewClient(server.URL)
-		requestBody := map[string]string{"data": "update"}
-
-		resp, err := Put[testResponse](context.Background(), client, "/update", requestBody, WithHeader("Authorization", "Bearer test-token"))
-
-		if err != nil {
-			t.Fatalf("Expected no error, but got: %v", err)
-		}
-		if resp.Message != successResponse.Message {
-			t.Errorf("Expected message 'success', but got '%s'", resp.Message)
-		}
-	})
-
-	t.Run("Successful DELETE request", func(t *testing.T) {
-		server := setupTestServer(t, successHandler)
-		defer server.Close()
-
-		client := NewClient(server.URL)
-
-		resp, err := Delete[testResponse](context.Background(), client, "/delete", nil, WithHeader("Authorization", "Bearer test-token"))
-
-		if err != nil {
-			t.Fatalf("Expected no error, but got: %v", err)
-		}
-		if resp.Message != successResponse.Message {
-			t.Errorf("Expected message 'success', but got '%s'", resp.Message)
-		}
-	})
-
-	t.Run("Client with custom HttpClient", func(t *testing.T) {
-		server := setupTestServer(t, successHandler)
-		defer server.Close()
-
-		customTransport := &http.Transport{}
-		customHttpClient := &http.Client{
-			Transport: customTransport,
-			Timeout:   10 * time.Second,
-		}
-
-		client := NewClient(server.URL, WithHttpClient(customHttpClient))
-
-		// Verify that the custom client is used
-		if client.httpClient.Timeout != 10*time.Second {
-			t.Errorf("Expected http client timeout to be 10s, but got %v", client.httpClient.Timeout)
-		}
-		if client.httpClient.Transport != customTransport {
-			t.Error("Expected http client to use the custom transport")
-		}
-
-		_, err := Get[testResponse](context.Background(), client, "/data", WithHeader("Authorization", "Bearer test-token"))
-		if err != nil {
-			t.Fatalf("Expected no error, but got: %v", err)
-		}
-	})
-
-	t.Run("JSON marshaling error", func(t *testing.T) {
-		client := NewClient("http://localhost")
-		// Create a body that cannot be marshaled to JSON (e.g., a channel)
-		invalidBody := make(chan int)
-
-		_, err := Post[testResponse](context.Background(), client, "/", invalidBody)
-
-		if err == nil {
-			t.Fatal("Expected a JSON marshaling error, but got nil")
-		}
-		if !strings.Contains(err.Error(), "error marshaling JSON") {
-			t.Errorf("Expected error to be a JSON marshaling error, but got: %v", err)
-		}
-	})
-
-	t.Run("JSON decoding error", func(t *testing.T) {
-		// Handler returns malformed JSON
-		malformedJSONHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"message": "success", "value": "not-an-int"}`)) // Value is a string, not int
-		})
-
-		server := setupTestServer(t, malformedJSONHandler)
-		defer server.Close()
-
-		client := NewClient(server.URL)
-		_, err := Get[testResponse](context.Background(), client, "/")
-
-		if err == nil {
-			t.Fatal("Expected a JSON decoding error, but got nil")
-		}
-		if !strings.Contains(err.Error(), "error decoding response JSON") {
-			t.Errorf("Expected error to be a JSON decoding error, but got: %v", err)
-		}
-	})
-
-	t.Run("Invalid base URL", func(t *testing.T) {
-		// Create a client with an invalid base URL (contains control characters)
-		client := NewClient("http://invalid-url:\n")
-		_, err := Get[testResponse](context.Background(), client, "/")
-
-		if err == nil {
-			t.Fatal("Expected an error for invalid base URL, but got nil")
-		}
-		if !strings.Contains(err.Error(), "invalid base URL") {
-			t.Errorf("Expected error to be an invalid base URL error, but got: %v", err)
-		}
-	})
-
-	t.Run("HTTP error with body read error", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// A more reliable way to cause a read error is to just close the connection.
-			// The httptest server's default behavior after the handler returns is to close the connection.
-			// To simulate an abrupt close, we can use the Hijacker.
-			w.Header().Set("Content-Length", "100")
-			w.WriteHeader(http.StatusInternalServerError)
-			hijacker, ok := w.(http.Hijacker)
-			if !ok {
-				http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-				return
-			}
-			conn, _, err := hijacker.Hijack()
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			// Instead of writing a response, just close the connection.
-			conn.Close()
-		}))
-
-		defer server.Close()
-
-		client := NewClient(server.URL)
-		_, err := Get[testResponse](context.Background(), client, "/")
-
-		if err == nil {
-			t.Fatal("Expected an error, but got nil")
-		}
-
-		// was closed unexpectedly. This error is wrapped by our "failed to read response body" message.
-		if !strings.Contains(err.Error(), "failed to read response body") {
-			t.Errorf("Expected error to be about reading the response body, but got: %v", err)
-		}
-	})
-
-	t.Run("Invalid endpoint URL", func(t *testing.T) {
-		client := NewClient("http://localhost")
-		_, err := Get[testResponse](context.Background(), client, "http://invalid-url:\n")
-
-		if err == nil {
-			t.Fatal("Expected an error for invalid endpoint URL, but got nil")
-		}
-		if !strings.Contains(err.Error(), "invalid endpoint URL") {
-			t.Errorf("Expected error to be an invalid endpoint URL error, but got: %v", err)
-		}
-	})
-
-	t.Run("Invalid HTTP method", func(t *testing.T) {
-		client := NewClient("http://localhost")
-		// Call doRequest directly to provide an invalid method
-		_, err := doRequest[testResponse](context.Background(), client, "INVALID METHOD", "/", nil)
-
-		if err == nil {
-			t.Fatal("Expected an error for invalid HTTP method, but got nil")
-		}
-		if !strings.Contains(err.Error(), "error creating request") {
-			t.Errorf("Expected error to be an invalid method error, but got: %v", err)
-		}
-	})
+func TestCustomHTTPClientSettingsArePreserved(t *testing.T) {
+	transport := &http.Transport{}
+	customClient := &http.Client{Transport: transport}
+	client, err := NewClient("https://example.com", WithHTTPClient(customClient))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.httpClient.Transport != transport || client.httpClient.Timeout != 0 {
+		t.Errorf("Custom HTTP client settings were not preserved: %+v", client.httpClient)
+	}
 }
