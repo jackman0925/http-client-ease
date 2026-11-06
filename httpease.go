@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const defaultMaxErrorBodyBytes int64 = 64 << 10
+
 // === Client Configuration ===
 
 // ClientOption is a functional option for configuring the Client.
@@ -31,6 +33,16 @@ func WithHttpClient(client *http.Client) ClientOption {
 	}
 }
 
+// WithMaxErrorBodyBytes sets the maximum number of error response bytes kept
+// in HTTPError. A negative value leaves the default unchanged.
+func WithMaxErrorBodyBytes(limit int64) ClientOption {
+	return func(c *Client) {
+		if limit >= 0 {
+			c.maxErrorBodyBytes = limit
+		}
+	}
+}
+
 // === Request Configuration ===
 
 // RequestOption is a functional option for configuring an http.Request.
@@ -46,19 +58,21 @@ func WithHeader(key, value string) RequestOption {
 // === HTTP Client ===
 
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL           string
+	httpClient        *http.Client
+	maxErrorBodyBytes int64
 }
 
-// HTTPError contains detailed information about a non-200 response.
+// HTTPError contains detailed information about a non-2xx response.
 type HTTPError struct {
 	StatusCode int
 	Status     string
 	Body       []byte
+	Truncated  bool
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("http error: status code %d, status %s, body: %s", e.StatusCode, e.Status, string(e.Body))
+	return fmt.Sprintf("http error: status code %d, status %s", e.StatusCode, e.Status)
 }
 
 // NewClient creates a new Client with the given base URL and options.
@@ -102,6 +116,7 @@ func NewClient(baseURL string, opts ...ClientOption) *Client {
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second, // 默认超时60秒
 		},
+		maxErrorBodyBytes: defaultMaxErrorBodyBytes,
 	}
 
 	for _, opt := range opts {
@@ -152,7 +167,7 @@ func doRequest[T any](ctx context.Context, c *Client, method, endpoint string, b
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, readErr := io.ReadAll(resp.Body)
+		respBody, truncated, readErr := readErrorBody(resp.Body, c.maxErrorBodyBytes)
 		if readErr != nil {
 			return nil, fmt.Errorf("received non-2xx status (%s), but failed to read response body: %w", resp.Status, readErr)
 		}
@@ -160,6 +175,7 @@ func doRequest[T any](ctx context.Context, c *Client, method, endpoint string, b
 			StatusCode: resp.StatusCode,
 			Status:     resp.Status,
 			Body:       respBody,
+			Truncated:  truncated,
 		}
 	}
 
@@ -172,6 +188,25 @@ func doRequest[T any](ctx context.Context, c *Client, method, endpoint string, b
 	}
 
 	return &responseBody, nil
+}
+
+func readErrorBody(body io.Reader, limit int64) ([]byte, bool, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	if limit == int64(^uint64(0)>>1) {
+		data, err := io.ReadAll(body)
+		return data, false, err
+	}
+
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(data)) <= limit {
+		return data, false, nil
+	}
+	return data[:limit], true, nil
 }
 
 func Get[T any](ctx context.Context, c *Client, endpoint string, reqOpts ...RequestOption) (*T, error) {

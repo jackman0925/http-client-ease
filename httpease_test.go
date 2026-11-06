@@ -1,10 +1,10 @@
 package httpease
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -176,9 +176,29 @@ func TestClient(t *testing.T) {
 		if !strings.Contains(string(httpErr.Body), "not found") {
 			t.Errorf("Expected error body to contain 'not found', but got '%s'", string(httpErr.Body))
 		}
-		expectedErrorMsg := fmt.Sprintf("http error: status code 404, status 404 Not Found, body: %s", errorBody)
+		expectedErrorMsg := "http error: status code 404, status 404 Not Found"
 		if httpErr.Error() != expectedErrorMsg {
 			t.Errorf("Expected error message '%s', but got '%s'", expectedErrorMsg, httpErr.Error())
+		}
+	})
+
+	t.Run("HTTP error body is limited and excluded from Error", func(t *testing.T) {
+		server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("sensitive-error-body"))
+		}))
+		defer server.Close()
+
+		_, err := Get[testResponse](context.Background(), NewClient(server.URL, WithMaxErrorBodyBytes(9)), "/")
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) {
+			t.Fatalf("Expected *HTTPError, but got %T", err)
+		}
+		if !httpErr.Truncated || !bytes.Equal(httpErr.Body, []byte("sensitive")) {
+			t.Errorf("Expected truncated body %q, got %q (truncated=%t)", "sensitive", httpErr.Body, httpErr.Truncated)
+		}
+		if strings.Contains(httpErr.Error(), "sensitive-error-body") {
+			t.Errorf("Error must not contain response body: %q", httpErr.Error())
 		}
 	})
 

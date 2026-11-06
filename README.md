@@ -76,6 +76,7 @@ func main() {
 
 -   `httpease.WithTimeout(duration time.Duration)`: Sets the timeout for the underlying `http.Client`.
 -   `httpease.WithHttpClient(client *http.Client)`: Provides a custom `http.Client` instance.
+-   `httpease.WithMaxErrorBodyBytes(limit int64)`: Limits the error-response body retained in `HTTPError` (default: 64 KiB).
 
 ### Request Options
 
@@ -83,7 +84,7 @@ func main() {
 
 ## Error Handling
 
-The library returns a custom `*httpease.HTTPError` for non-2xx HTTP responses, allowing you to inspect the status code and response body.
+The library returns a custom `*httpease.HTTPError` for non-2xx HTTP responses, allowing you to inspect the status code and response body. To avoid accidentally logging sensitive server output, `HTTPError.Error()` only includes status information. `Body` retains up to the configured limit and `Truncated` reports whether it was shortened.
 
 ```go
 if err != nil {
